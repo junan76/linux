@@ -2394,12 +2394,18 @@ static int __init init_mtd(void)
 		goto err_bdi;
 	}
 
+	/*
+	 * Create "/proc/mtd", show informations about mtd module to userspace.
+	 */
 	proc_mtd = proc_create_single("mtd", 0, NULL, mtd_proc_show);
 
 	ret = init_mtdchar();
 	if (ret)
 		goto out_procfs;
 
+	/*
+	 * Return ERR_PTR if CONFIG_DEBUG_FS is off, a "dentry" pointer otherwise.
+	 */
 	dfs_dir_mtd = debugfs_create_dir("mtd", NULL);
 
 	return 0;
