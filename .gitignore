@@ -36,7 +36,7 @@
 *.mod.c
 *.o
 *.o.*
-*.patch
+# *.patch
 *.s
 *.so
 *.so.dbg
@@ -109,8 +109,8 @@ modules.order
 patches-*
 
 # quilt's files
-patches
-series
+# patches
+# series
 
 # ctags files
 tags

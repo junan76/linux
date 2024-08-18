@@ -1,0 +1,238 @@
+Index: linux/scripts/runqemu
+===================================================================
+--- /dev/null
++++ linux/scripts/runqemu
+@@ -0,0 +1,46 @@
++#!/bin/bash
++
++src_tree=$(realpath "$(dirname "$0")"/..)
++build_tree=$src_tree/build/vexpress
++
++zimage_file=$build_tree/arch/arm/boot/zImage
++dtb_file=$build_tree/arch/arm/boot/dts/vexpress-v2p-ca9.dtb
++initramfs_file=$build_tree/initramfs.cpio.gz
++
++kernel_dbg_option=
++qemu_dbg_option=
++
++QEMU=qemu-system-arm
++
++while getopts "dDh" opt "$@"; do
++    case "$opt" in
++    d)
++        :
++        kernel_dbg_option="-s =S"
++        ;;
++    D)
++        :
++        qemu_dbg_option="gdb --args"
++        ;;
++    h)
++        :
++        usage
++        exit 0
++        ;;
++    *)
++        :
++        echo "invalid option"
++        usage
++        exit 1
++        ;;
++    esac
++done
++
++set -x
++# shellcheck disable=SC2086
++$qemu_dbg_option "$QEMU" -M vexpress-a9 \
++    -kernel "$zimage_file" \
++    -dtb "$dtb_file" \
++    -initrd "$initramfs_file" \
++    -append "console=ttyAMA0 rdinit=/bin/init.sh" \
++    -nographic $kernel_dbg_option
+Index: linux/arch/arm/boot/dts/vexpress-v2m.dtsi
+===================================================================
+--- linux.orig/arch/arm/boot/dts/vexpress-v2m.dtsi
++++ linux/arch/arm/boot/dts/vexpress-v2m.dtsi
+@@ -90,8 +90,18 @@
+ 				reg = <0 0x00000000 0x04000000>,
+ 				      <1 0x00000000 0x04000000>;
+ 				bank-width = <4>;
+-				partitions {
+-					compatible = "arm,arm-firmware-suite";
++				#address-cells = <1>;
++				#size-cells = <1>;
++				mtd-shadow-part;
++
++				partition@0 {
++					reg = <0 0x1000000>;
++					label = "partition0";
++				};
++
++				partition@1000000 {
++					reg = <0x1000000 0x1000000>;
++					label = "partition1";
+ 				};
+ 			};
+ 
+Index: linux/drivers/mtd/Kconfig
+===================================================================
+--- linux.orig/drivers/mtd/Kconfig
++++ linux/drivers/mtd/Kconfig
+@@ -12,6 +12,12 @@ menuconfig MTD
+ 
+ if MTD
+ 
++config MTD_SHADOW_PARTITION
++	bool "MTD shadow partition"
++	help
++	  Turn this option on if you want any partition to be a backup of the
++	  others on the same flash device.
++
+ config MTD_TESTS
+ 	tristate "MTD tests support (DANGEROUS)"
+ 	depends on m
+Index: linux/drivers/mtd/mtdcore.c
+===================================================================
+--- linux.orig/drivers/mtd/mtdcore.c
++++ linux/drivers/mtd/mtdcore.c
+@@ -1247,7 +1247,7 @@ EXPORT_SYMBOL_GPL(__put_mtd_device);
+  * negative error code if the operation failed and update instr->fail_addr
+  * to point the portion that was not properly erased.
+  */
+-int mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
++static int __mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
+ {
+ 	struct mtd_info *master = mtd_get_master(mtd);
+ 	u64 mst_ofs = mtd_get_master_ofs(mtd, 0);
+@@ -1293,6 +1293,32 @@ int mtd_erase(struct mtd_info *mtd, stru
+ 
+ 	return ret;
+ }
++
++int mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
++{
++#ifdef CONFIG_MTD_SHADOW_PARTITION
++	struct mtd_info *master = mtd_get_master(mtd);
++	int ret;
++
++	if(master != mtd && master->mtd_shadow_part) {
++		mutex_lock(&master->shadow_part_lock);
++		list_for_each_entry(mtd, &master->shadow_part_list, shadow_part_node) {
++			ret = __mtd_erase(mtd, instr);
++			if(ret < 0) {
++				pr_err("mtd_erase error!\n");
++				break;
++			}
++		}
++		mutex_unlock(&master->shadow_part_lock);
++
++		// pr_info("%s: mtd_erase ok!\n", master->name);
++		return ret;
++	} else
++		return __mtd_erase(mtd, instr);
++#else
++	return __mtd_erase(mtd, instr);
++#endif
++}
+ EXPORT_SYMBOL_GPL(mtd_erase);
+ 
+ /*
+@@ -1392,8 +1418,8 @@ int mtd_read(struct mtd_info *mtd, loff_
+ }
+ EXPORT_SYMBOL_GPL(mtd_read);
+ 
+-int mtd_write(struct mtd_info *mtd, loff_t to, size_t len, size_t *retlen,
+-	      const u_char *buf)
++static int __mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
++		       size_t *retlen, const u_char *buf)
+ {
+ 	struct mtd_oob_ops ops = {
+ 		.len = len,
+@@ -1406,6 +1432,33 @@ int mtd_write(struct mtd_info *mtd, loff
+ 
+ 	return ret;
+ }
++
++int mtd_write(struct mtd_info *mtd, loff_t to, size_t len, size_t *retlen,
++	      const u_char *buf)
++{
++#ifdef CONFIG_MTD_SHADOW_PARTITION
++	struct mtd_info *master = mtd_get_master(mtd);
++	int ret;
++
++	if(master != mtd && master->mtd_shadow_part) {
++		mutex_lock(&master->shadow_part_lock);
++		list_for_each_entry(mtd, &master->shadow_part_list, shadow_part_node) {
++			ret = __mtd_write(mtd, to, len, retlen, buf);
++			if(ret < 0) {
++				pr_err("mtd_erase error!\n");
++				break;
++			}
++		}
++		mutex_unlock(&master->shadow_part_lock);
++
++		// pr_info("%s: mtd_erase ok!\n", master->name);
++		return ret;
++	} else
++		return __mtd_write(mtd, to, len, retlen, buf);
++#else
++	return __mtd_write(mtd, to, len, retlen, buf);
++#endif
++}
+ EXPORT_SYMBOL_GPL(mtd_write);
+ 
+ /*
+Index: linux/drivers/mtd/mtdpart.c
+===================================================================
+--- linux.orig/drivers/mtd/mtdpart.c
++++ linux/drivers/mtd/mtdpart.c
+@@ -400,6 +400,15 @@ int add_mtd_partitions(struct mtd_info *
+ 	printk(KERN_NOTICE "Creating %d MTD partitions on \"%s\":\n",
+ 	       nbparts, parent->name);
+ 
++#ifdef CONFIG_MTD_SHADOW_PARTITION
++	parent->mtd_shadow_part = of_property_read_bool(parent->dev.of_node, "mtd-shadow-part");
++	if(parent->mtd_shadow_part) {
++		INIT_LIST_HEAD(&parent->shadow_part_list);
++		mutex_init(&parent->shadow_part_lock);
++	}
++	pr_info("%s: mtd_shadow_part=%d\n", parent->name, parent->mtd_shadow_part);
++#endif
++
+ 	for (i = 0; i < nbparts; i++) {
+ 		child = allocate_partition(parent, parts + i, i, cur_offset);
+ 		if (IS_ERR(child)) {
+@@ -423,6 +432,15 @@ int add_mtd_partitions(struct mtd_info *
+ 
+ 		mtd_add_partition_attrs(child);
+ 
++#ifdef CONFIG_MTD_SHADOW_PARTITION
++		if(parent->mtd_shadow_part) {
++			mutex_lock(&parent->shadow_part_lock);
++			list_add(&child->shadow_part_node, &parent->shadow_part_list);
++			mutex_unlock(&parent->shadow_part_lock);
++			pr_info("Add shadow partition to: %s\n", parent->name);
++		}
++#endif
++
+ 		/* Look for subpartitions */
+ 		parse_mtd_partitions(child, parts[i].types, NULL);
+ 
+Index: linux/include/linux/mtd/mtd.h
+===================================================================
+--- linux.orig/include/linux/mtd/mtd.h
++++ linux/include/linux/mtd/mtd.h
+@@ -396,6 +396,13 @@ struct mtd_info {
+ 
+ 	struct mtd_part part;
+ 	struct mtd_master master;
++
++#ifdef CONFIG_MTD_SHADOW_PARTITION
++	struct list_head shadow_part_list;
++	struct list_head shadow_part_node;
++	struct mutex shadow_part_lock;
++	bool mtd_shadow_part;
++#endif
+ };
+ 
+ static inline struct mtd_info *mtd_get_master(struct mtd_info *mtd)
